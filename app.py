@@ -1,17 +1,22 @@
 """Local Streamlit UI for the disaster-tweet classifier.
 
 Run with:  streamlit run app.py
-Opens on http://localhost:8501 and lets a non-technical user paste a tweet and
-get a label, a calibrated confidence, and a plain explanation of *why*.
+Opens on http://localhost:8501. A non-technical user can classify a single
+message (with an explanation of *why*) or upload a CSV for batch scoring.
 """
 
 from __future__ import annotations
 
+import json
+import os
+
+import pandas as pd
 import streamlit as st
 
 from src.model import DisasterModel, Prediction
 
 MODEL_PATH = "model.joblib"
+METRICS_PATH = "metrics.json"
 MAX_CHARS = 1000
 EXAMPLES = [
     "Forest fire near La Ronge Sask. Canada",
@@ -25,6 +30,15 @@ EXAMPLES = [
 def get_model() -> DisasterModel:
     """Load the model once per server process."""
     return DisasterModel.load(MODEL_PATH)
+
+
+@st.cache_data
+def get_metrics() -> dict:
+    """Load validation metrics for the model card, if present."""
+    if os.path.exists(METRICS_PATH):
+        with open(METRICS_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    return {}
 
 
 def _set_example(text: str) -> None:
@@ -44,7 +58,7 @@ def render_result(pred: Prediction) -> None:
 
     with st.expander("Why this prediction?", expanded=True):
         if not pred.drivers:
-            st.write("No strong word-level signals — the model is near its decision boundary.")
+            st.write("No strong word-level signals — the model is near its boundary.")
             return
         st.caption("Words pushing the call toward 🟥 disaster (red) or 🟩 not (green):")
         for word, weight in pred.drivers:
@@ -57,14 +71,73 @@ def render_result(pred: Prediction) -> None:
             )
 
 
+def single_tab(prefill: str | None) -> None:
+    """Single-message classification with examples and explanation."""
+    result_slot = st.container()  # results render at the top, above the controls
+
+    st.write("Try an example:")
+    columns = st.columns(len(EXAMPLES))
+    for column, example in zip(columns, EXAMPLES):
+        column.button(example[:24] + "…", on_click=_set_example, args=(example,), help=example)
+
+    text = st.text_area("Message text", key="tweet", max_chars=MAX_CHARS, height=120)
+    if st.button("Classify", type="primary") or prefill:
+        with result_slot:
+            if not text or not text.strip():
+                st.warning("Please enter some text to classify.")
+            else:
+                render_result(get_model().predict_one(text.strip()))
+
+
+def batch_tab() -> None:
+    """Upload a CSV with a 'text' column and score every row."""
+    st.write("Upload a CSV with a **text** column to score many messages at once.")
+    upload = st.file_uploader("CSV file", type="csv")
+    if upload is None:
+        return
+    df = pd.read_csv(upload)
+    if "text" not in df.columns:
+        st.error(f"CSV needs a 'text' column; found {list(df.columns)}.")
+        return
+    texts = df["text"].fillna("").astype(str).tolist()
+    scores = get_model().predict_proba(texts)
+    result = pd.DataFrame(
+        {"text": texts, "label": (scores >= 0.5).astype(int), "score": scores.round(4)}
+    )
+    st.dataframe(result, use_container_width=True)
+    st.download_button(
+        "Download predictions.csv", result.to_csv(index=False), "predictions.csv", "text/csv"
+    )
+
+
+def about() -> None:
+    """A short model card: what it is, how it scored, and its limits."""
+    m = get_metrics()
+    with st.expander("About this model (model card)"):
+        if m:
+            st.write(
+                f"**Validation** (20% hold-out, n={m.get('n_val', '—')}): "
+                f"accuracy {m.get('accuracy')}, disaster-F1 {m.get('f1')}, "
+                f"ROC-AUC {m.get('roc_auc')}, Brier {m.get('brier_score')}."
+            )
+        st.write(
+            "Word + character TF-IDF features into a logistic-regression classifier, "
+            "trained on ~7,600 labelled tweets. Linear by design so each prediction "
+            "is explainable.\n\n"
+            "**Use as decision-support, not an authority.** A human should confirm "
+            "before any action. Weaker on sarcasm, metaphor, non-English text, and "
+            "events newer than the training data; false negatives (missing a real "
+            "disaster) are the costliest error and the reason confidence is always shown."
+        )
+
+
 def main() -> None:
     """Compose the page."""
     st.set_page_config(page_title="Disaster Tweet Classifier", page_icon="🌍")
     st.title("🌍 Disaster Tweet Classifier")
     st.write(
-        "Paste a short message and the model estimates whether it describes a "
-        "**real disaster**. Built as decision-support — a human should confirm "
-        "before any action is taken."
+        "Estimate whether a short message describes a **real disaster**. "
+        "Built as decision-support — a human should confirm before any action."
     )
 
     st.session_state.setdefault("tweet", "")
@@ -72,26 +145,17 @@ def main() -> None:
     if prefill and not st.session_state.tweet:
         st.session_state.tweet = prefill
 
-    st.write("Try an example:")
-    columns = st.columns(len(EXAMPLES))
-    for column, example in zip(columns, EXAMPLES):
-        column.button(
-            example[:24] + "…", on_click=_set_example, args=(example,), help=example
-        )
+    single, batch = st.tabs(["Single message", "Batch (CSV)"])
+    with single:
+        single_tab(prefill)
+    with batch:
+        batch_tab()
 
-    text = st.text_area("Message text", key="tweet", max_chars=MAX_CHARS, height=120)
-
-    if st.button("Classify", type="primary") or prefill:
-        if not text or not text.strip():
-            st.warning("Please enter some text to classify.")
-        else:
-            render_result(get_model().predict_one(text.strip()))
-
+    about()
     st.divider()
     st.caption(
-        "Linear TF-IDF + logistic-regression model trained on ~7,600 labelled "
-        "tweets. Predictions are probabilistic and can be wrong, especially on "
-        "sarcasm, metaphor, and events newer than the training data."
+        "Linear TF-IDF + logistic-regression model. Predictions are probabilistic "
+        "and can be wrong — always review confidence and rationale."
     )
 
 
